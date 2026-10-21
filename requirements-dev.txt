@@ -1,0 +1,6 @@
+-r requirements.txt
+pytest>=8
+moto[s3,sns]>=5
+ruff>=0.6
+cfn-lint>=1.0
+matplotlib>=3.8

@@ -1,0 +1,621 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Fohor - Kathmandu Valley waste-flow lakehouse. Reads Overture Maps and HRSL from AWS Open
+  Data, builds bronze/silver/gold in S3 behind a quality gate, serves gold through Athena.
+  Serverless, scales to zero. Deploy: infra/README.md. Cost: docs/COST.md.
+
+Parameters:
+  OpsEmail:
+    Type: String
+    Default: ""
+    Description: Optional email for blocked releases, warnings, alarms and the budget warning.
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 3
+
+Conditions:
+  HasOpsEmail: !Not [!Equals [!Ref OpsEmail, ""]]
+
+Globals:
+  Function:
+    # Graviton: about 20% cheaper per GB-second than x86 for the same work.
+    Architectures: [arm64]
+    Tracing: Active
+    Environment:
+      Variables:
+        LAKE_BUCKET: !Ref LakeBucket
+        OPS_TOPIC: !Ref OpsTopic
+        HOME: /tmp  # DuckDB writes its config under $HOME
+
+Resources:
+  # ---------------- storage ----------------
+  LakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # Bronze is keyed by content fingerprint and never overwritten, so versioning mostly
+      # protects gold/_current.json and silver from a bad rebuild.
+      VersioningConfiguration: {Status: Enabled}
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-derived-versions
+            Status: Enabled
+            NoncurrentVersionExpiration: {NoncurrentDays: 30}
+          - Id: expire-athena-results
+            Status: Enabled
+            Prefix: athena-results/
+            ExpirationInDays: 7
+          # No lifecycle on bronze/: Overture deletes old releases from its bucket after a
+          # few months, and bronze is then the only copy we can rebuild a release from.
+          # It is ~60 MB per distinct release; IA/Glacier would cost more in minimums.
+
+  # ---------------- catalog and query ----------------
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: fohor
+        Description: Kathmandu Valley waste-flow gold tables, one partition per Overture release.
+
+  # Partition projection with an injected release value: queries say
+  # WHERE release = '2026-09-23.1' and Athena reads exactly one prefix. No crawler, no
+  # MSCK REPAIR, and a malformed file cannot change the schema.
+  MunicipalityWasteTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: municipality_waste
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          projection.enabled: "true"
+          projection.release.type: injected
+          storage.location.template: !Sub "s3://${LakeBucket}/gold/municipality_waste/release=${!release}/"
+        PartitionKeys:
+          - {Name: release, Type: string}
+        StorageDescriptor:
+          Location: !Sub "s3://${LakeBucket}/gold/municipality_waste/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: gers_id, Type: string}
+            - {Name: name_en, Type: string}
+            - {Name: district, Type: string}
+            - {Name: population, Type: bigint}
+            - {Name: population_source, Type: string}
+            - {Name: population_share, Type: double}
+            - {Name: tonnes_per_day, Type: double}
+            - {Name: tonnes_per_day_building_share, Type: double}
+            - {Name: tonnes_per_day_at_adb_rate, Type: double}
+            - {Name: implied_kg_per_person_day, Type: double}
+            - {Name: haul_km_mean, Type: double}
+            - {Name: haul_km_p10, Type: double}
+            - {Name: haul_km_p90, Type: double}
+            - {Name: truck_trips_per_day, Type: double}
+            - {Name: truck_km_per_day, Type: double}
+            - {Name: round_trip_hours, Type: double}
+
+  BlockadeBacklogTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: blockade_backlog
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          projection.enabled: "true"
+          projection.release.type: injected
+          storage.location.template: !Sub "s3://${LakeBucket}/gold/blockade_backlog/release=${!release}/"
+        PartitionKeys:
+          - {Name: release, Type: string}
+        StorageDescriptor:
+          Location: !Sub "s3://${LakeBucket}/gold/blockade_backlog/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: name_en, Type: string}
+            - {Name: district, Type: string}
+            - {Name: days_blocked, Type: bigint}
+            - {Name: backlog_tonnes, Type: double}
+            - {Name: organic_tonnes, Type: double}
+            - {Name: truckloads, Type: double}
+            - {Name: days_to_clear_after_reopening, Type: double}
+            - {Name: days_to_clear_if_surge_120pct, Type: double}
+            - {Name: days_to_clear_if_surge_150pct, Type: double}
+
+  DropOffAccessTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: drop_off_access
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          projection.enabled: "true"
+          projection.release.type: injected
+          storage.location.template: !Sub "s3://${LakeBucket}/gold/drop_off_access/release=${!release}/"
+        PartitionKeys:
+          - {Name: release, Type: string}
+        StorageDescriptor:
+          Location: !Sub "s3://${LakeBucket}/gold/drop_off_access/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: gers_id, Type: string}
+            - {Name: name_en, Type: string}
+            - {Name: district, Type: string}
+            - {Name: population, Type: bigint}
+            - {Name: mapped_drop_offs, Type: bigint}
+            - {Name: median_distance_m, Type: double}
+            - {Name: share_within_500m, Type: double}
+            - {Name: share_within_1km, Type: double}
+            - {Name: share_within_2km, Type: double}
+            - {Name: people_beyond_2km, Type: double}
+
+  FacilityRegistryTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: facility_registry
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          projection.enabled: "true"
+          projection.release.type: injected
+          storage.location.template: !Sub "s3://${LakeBucket}/gold/facility_registry/release=${!release}/"
+        PartitionKeys:
+          - {Name: release, Type: string}
+        StorageDescriptor:
+          Location: !Sub "s3://${LakeBucket}/gold/facility_registry/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: facility_key, Type: string}
+            - {Name: gers_id, Type: string}
+            - {Name: name, Type: string}
+            - {Name: kind, Type: string}
+            - {Name: active, Type: boolean}
+            - {Name: review, Type: string}
+            - {Name: duplicate_of, Type: string}
+            - {Name: evidence, Type: string}
+            - {Name: dataset, Type: string}
+            - {Name: source_record, Type: string}
+            - {Name: confidence, Type: double}
+            - {Name: local_gov, Type: string}
+            - {Name: lon, Type: double}
+            - {Name: lat, Type: double}
+            - {Name: first_seen_release, Type: string}
+            - {Name: last_seen_release, Type: string}
+
+  DataGapsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: data_gaps
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          projection.enabled: "true"
+          projection.release.type: injected
+          storage.location.template: !Sub "s3://${LakeBucket}/gold/data_gaps/release=${!release}/"
+        PartitionKeys:
+          - {Name: release, Type: string}
+        StorageDescriptor:
+          Location: !Sub "s3://${LakeBucket}/gold/data_gaps/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: name_en, Type: string}
+            - {Name: population, Type: bigint}
+            - {Name: drop_offs, Type: bigint}
+            - {Name: public_bins, Type: bigint}
+            - {Name: collectors, Type: bigint}
+            - {Name: people_per_drop_off, Type: double}
+
+  FacilityChangesTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: facility_changes
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          projection.enabled: "true"
+          projection.release.type: injected
+          storage.location.template: !Sub "s3://${LakeBucket}/gold/facility_changes/release=${!release}/"
+        PartitionKeys:
+          - {Name: release, Type: string}
+        StorageDescriptor:
+          Location: !Sub "s3://${LakeBucket}/gold/facility_changes/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: change, Type: string}
+            - {Name: facility_key, Type: string}
+            - {Name: gers_id, Type: string}
+            - {Name: previous_gers_id, Type: string}
+            - {Name: name, Type: string}
+            - {Name: kind, Type: string}
+
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: fohor
+      Description: Analyst queries over the Fohor gold tables.
+      State: ENABLED
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        # Gold is under 1 MB per release. A query scanning 1 GB is a mistake; stop it.
+        BytesScannedCutoffPerQuery: 1073741824
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${LakeBucket}/athena-results/"
+          EncryptionConfiguration: {EncryptionOption: SSE_S3}
+
+  # ---------------- messaging ----------------
+  OpsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: fohor-ops
+
+  OpsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasOpsEmail
+    Properties: {TopicArn: !Ref OpsTopic, Protocol: email, Endpoint: !Ref OpsEmail}
+
+  # ---------------- compute ----------------
+  # Upstream buckets are read with unsigned (anonymous) requests, which never use these
+  # roles, so each role only needs the lake.
+  SensorFunction:
+    Type: AWS::Serverless::Function
+    Metadata: {DockerContext: .., Dockerfile: infra/Dockerfile.lambda, DockerTag: v1}
+    Properties:
+      PackageType: Image
+      ImageConfig: {Command: ["fohor.aws.handlers.sensor_handler"]}
+      MemorySize: 256
+      Timeout: 30
+      Policies:
+        - S3ReadPolicy: {BucketName: !Ref LakeBucket}
+
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Metadata: {DockerContext: .., Dockerfile: infra/Dockerfile.lambda, DockerTag: v1}
+    Properties:
+      PackageType: Image
+      ImageConfig: {Command: ["fohor.aws.handlers.ingest_handler"]}
+      # The biggest theme (road segments) reads ~63 MB of row groups out of 72 GB and
+      # decodes ~95k rows. 1.5 GB gives enough CPU to finish in ~15 s.
+      MemorySize: 1536
+      Timeout: 300
+      Policies:
+        - S3CrudPolicy: {BucketName: !Ref LakeBucket}
+
+  HrslFunction:
+    Type: AWS::Serverless::Function
+    Metadata: {DockerContext: .., Dockerfile: infra/Dockerfile.lambda, DockerTag: v1}
+    Properties:
+      PackageType: Image
+      ImageConfig: {Command: ["fohor.aws.handlers.hrsl_handler"]}
+      # 14 MB gzip, 3 million rows for all of Nepal; clipped to the valley before writing.
+      MemorySize: 1024
+      Timeout: 120
+      Policies:
+        - S3CrudPolicy: {BucketName: !Ref LakeBucket}
+
+  SilverFunction:
+    Type: AWS::Serverless::Function
+    Metadata: {DockerContext: .., Dockerfile: infra/Dockerfile.lambda, DockerTag: v1}
+    Properties:
+      PackageType: Image
+      ImageConfig: {Command: ["fohor.aws.handlers.silver_handler"]}
+      # Road graph (88k edges) + Dijkstra + 111k population points: ~6 s and ~700 MB locally.
+      MemorySize: 2048
+      Timeout: 300
+      Policies:
+        - S3CrudPolicy: {BucketName: !Ref LakeBucket}
+
+  GoldFunction:
+    Type: AWS::Serverless::Function
+    Metadata: {DockerContext: .., Dockerfile: infra/Dockerfile.lambda, DockerTag: v1}
+    Properties:
+      PackageType: Image
+      ImageConfig: {Command: ["fohor.aws.handlers.gold_handler"]}
+      MemorySize: 1024
+      Timeout: 120
+      Policies:
+        - S3CrudPolicy: {BucketName: !Ref LakeBucket}
+        - SNSPublishMessagePolicy: {TopicName: !GetAtt OpsTopic.TopicName}
+
+  # ---------------- orchestration ----------------
+  PipelineStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: fohor-release
+      Type: STANDARD
+      Tracing: {Enabled: true}
+      Logging:
+        Level: ERROR
+        IncludeExecutionData: false
+        Destinations:
+          - CloudWatchLogsLogGroup: {LogGroupArn: !GetAtt PipelineLogs.Arn}
+      Policies:
+        - LambdaInvokePolicy: {FunctionName: !Ref SensorFunction}
+        - LambdaInvokePolicy: {FunctionName: !Ref IngestFunction}
+        - LambdaInvokePolicy: {FunctionName: !Ref HrslFunction}
+        - LambdaInvokePolicy: {FunctionName: !Ref SilverFunction}
+        - LambdaInvokePolicy: {FunctionName: !Ref GoldFunction}
+        - SNSPublishMessagePolicy: {TopicName: !GetAtt OpsTopic.TopicName}
+        - CloudWatchLogsFullAccess
+      DefinitionSubstitutions:
+        SensorArn: !GetAtt SensorFunction.Arn
+        IngestArn: !GetAtt IngestFunction.Arn
+        HrslArn: !GetAtt HrslFunction.Arn
+        SilverArn: !GetAtt SilverFunction.Arn
+        GoldArn: !GetAtt GoldFunction.Arn
+        OpsTopicArn: !Ref OpsTopic
+      Definition:
+        Comment: Build one Overture release. Every step is idempotent, so any step can be retried or re-run.
+        StartAt: Sensor
+        States:
+          Sensor:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters: {FunctionName: "${SensorArn}", "Payload.$": "$"}
+            OutputPath: $.Payload
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException, Lambda.SdkClientException]
+                IntervalSeconds: 10
+                MaxAttempts: 3
+                BackoffRate: 3
+            Next: NewRelease
+          NewRelease:
+            Type: Choice
+            Choices:
+              - Variable: $.new
+                BooleanEquals: true
+                Next: IngestThemes
+            Default: NothingToDo
+          NothingToDo:
+            Type: Succeed
+          # Six themes in parallel. Each writes its own manifest entry, so they cannot
+          # overwrite each other (docs/CHALLENGES_AND_BUGS.md #6).
+          IngestThemes:
+            Type: Map
+            ItemsPath: $.themes
+            MaxConcurrency: 6
+            ItemSelector:
+              "release.$": $.release
+              "theme.$": $$.Map.Item.Value
+            ItemProcessor:
+              ProcessorConfig: {Mode: INLINE}
+              StartAt: IngestTheme
+              States:
+                IngestTheme:
+                  Type: Task
+                  Resource: arn:aws:states:::lambda:invoke
+                  Parameters: {FunctionName: "${IngestArn}", "Payload.$": "$"}
+                  OutputPath: $.Payload
+                  Retry:
+                    # S3 throttling and slow reads from the public bucket are transient.
+                    - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException, Lambda.SdkClientException, States.Timeout, OSError]
+                      IntervalSeconds: 15
+                      MaxAttempts: 3
+                      BackoffRate: 3
+                      JitterStrategy: FULL
+                  End: true
+            ResultPath: $.ingest
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: NotifyFailure
+            Next: Hrsl
+          Hrsl:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters: {FunctionName: "${HrslArn}", "Payload.$": "$"}
+            ResultPath: $.hrsl
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException, Lambda.SdkClientException, States.Timeout]
+                IntervalSeconds: 10
+                MaxAttempts: 3
+                BackoffRate: 3
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: NotifyFailure
+            Next: Silver
+          Silver:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters: {FunctionName: "${SilverArn}", "Payload.$": "$"}
+            OutputPath: $.Payload
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException, Lambda.SdkClientException]
+                IntervalSeconds: 10
+                MaxAttempts: 2
+                BackoffRate: 3
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: NotifyFailure
+            Next: Gold
+          Gold:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters: {FunctionName: "${GoldArn}", "Payload.$": "$"}
+            OutputPath: $.Payload
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException, Lambda.SdkClientException]
+                IntervalSeconds: 10
+                MaxAttempts: 2
+                BackoffRate: 3
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: NotifyFailure
+            End: true
+          NotifyFailure:
+            Type: Task
+            Resource: arn:aws:states:::sns:publish
+            Parameters:
+              TopicArn: "${OpsTopicArn}"
+              Subject: Fohor release build failed
+              "Message.$": "States.Format('Run failed: {}', States.JsonToString($.error))"
+            Next: Failed
+          Failed:
+            Type: Fail
+      Events:
+        Weekly:
+          Type: ScheduleV2
+          Properties:
+            # Overture ships about monthly. A weekly check finds a release within 7 days and
+            # costs 4 sensor invocations a month when there is nothing new.
+            ScheduleExpression: cron(0 2 ? * MON *)
+            Input: '{}'
+            RetryPolicy: {MaximumRetryAttempts: 2, MaximumEventAgeInSeconds: 3600}
+            DeadLetterConfig: {Arn: !GetAtt SchedulerDLQ.Arn}
+
+  SchedulerDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+
+  # CloudWatch keeps logs forever by default, which is a slow cost leak.
+  PipelineLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: /aws/vendedlogs/states/fohor-release, RetentionInDays: 30}
+  SensorLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub "/aws/lambda/${SensorFunction}", RetentionInDays: 14}
+  IngestLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub "/aws/lambda/${IngestFunction}", RetentionInDays: 14}
+  HrslLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub "/aws/lambda/${HrslFunction}", RetentionInDays: 14}
+  SilverLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub "/aws/lambda/${SilverFunction}", RetentionInDays: 14}
+  GoldLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub "/aws/lambda/${GoldFunction}", RetentionInDays: 14}
+
+  # ---------------- alarms ----------------
+  PipelineFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: A release build failed after retries.
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions: [{Name: StateMachineArn, Value: !Ref PipelineStateMachine}]
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsTopic]
+
+  ReleaseBlockedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: A release failed the quality gate; gold still points at the last good release.
+      Namespace: Fohor
+      MetricName: ReleasesBlocked
+      Statistic: Maximum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsTopic]
+
+  ReleaseStaleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >
+        The newest release we have built is over 60 days old. Overture ships monthly, so
+        either upstream changed its layout or the sensor is broken. Missing data counts as
+        breaching: a sensor that stopped running is the same problem.
+      Namespace: Fohor
+      MetricName: ReleaseAgeDays
+      Statistic: Maximum
+      Period: 604800
+      EvaluationPeriods: 1
+      Threshold: 60
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref OpsTopic]
+
+  DLQNotEmptyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: A scheduled run was dropped after all retries.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{Name: QueueName, Value: !GetAtt SchedulerDLQ.QueueName}]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [!Ref OpsTopic]
+
+  # ---------------- cost guardrail ----------------
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Condition: HasOpsEmail
+    Properties:
+      Budget:
+        BudgetName: fohor-monthly
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: {Amount: !Ref MonthlyBudgetUsd, Unit: USD}
+      NotificationsWithSubscribers:
+        - Notification: {NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 80}
+          Subscribers: [{SubscriptionType: EMAIL, Address: !Ref OpsEmail}]
+        - Notification: {NotificationType: FORECASTED, ComparisonOperator: GREATER_THAN, Threshold: 100}
+          Subscribers: [{SubscriptionType: EMAIL, Address: !Ref OpsEmail}]
+
+Outputs:
+  LakeBucketName:
+    Value: !Ref LakeBucket
+  StateMachineArn:
+    Value: !Ref PipelineStateMachine
+  AthenaWorkGroup:
+    Value: !Ref AthenaWorkGroup
+  OpsTopicArn:
+    Value: !Ref OpsTopic

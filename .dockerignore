@@ -1,0 +1,6 @@
+.venv
+lake
+tests
+docs
+.git
+.aws-sam

@@ -1,0 +1,8 @@
+boto3>=1.35
+duckdb>=1.2
+networkx>=3.3
+numpy>=2.0
+pandas>=2.2
+pyarrow>=17
+scipy>=1.13
+shapely>=2.0

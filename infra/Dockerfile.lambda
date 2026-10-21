@@ -1,0 +1,8 @@
+# One image, five Lambda functions; template.yaml picks the handler with ImageConfig.Command.
+# pandas + pyarrow + duckdb + scipy + shapely are ~400 MB installed, over the 250 MB zip limit.
+FROM public.ecr.aws/lambda/python:3.12-arm64
+COPY requirements.txt ${LAMBDA_TASK_ROOT}/
+RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt
+COPY fohor ${LAMBDA_TASK_ROOT}/fohor
+COPY seeds ${LAMBDA_TASK_ROOT}/seeds
+CMD ["fohor.aws.handlers.sensor_handler"]

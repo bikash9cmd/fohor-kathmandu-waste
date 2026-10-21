@@ -1,0 +1,16 @@
+level,name,district,population,source,note
+district,Kathmandu,Kathmandu,2041587,https://en.wikipedia.org/wiki/2021_Nepal_census,NSO National Population and Housing Census 2021
+district,Lalitpur,Lalitpur,551667,https://en.wikipedia.org/wiki/2021_Nepal_census,NSO National Population and Housing Census 2021
+district,Bhaktapur,Bhaktapur,432132,https://en.wikipedia.org/wiki/2021_Nepal_census,"District page table says 430,408; census page and district text say 432,132"
+local_gov,Kathmandu Metropolitan City,Kathmandu,845767,https://en.wikipedia.org/wiki/Kathmandu_District,2021 census
+local_gov,Budhanilkantha,Kathmandu,179688,https://en.wikipedia.org/wiki/Kathmandu_District,2021 census
+local_gov,Tarakeshwar,Kathmandu,151508,https://en.wikipedia.org/wiki/Kathmandu_District,2021 census
+local_gov,Gokarneshwar,Kathmandu,151200,https://en.wikipedia.org/wiki/Kathmandu_District,2021 census
+local_gov,Chandragiri,Kathmandu,136928,https://en.wikipedia.org/wiki/Kathmandu_District,2021 census
+local_gov,Tokha,Kathmandu,135741,https://en.wikipedia.org/wiki/Kathmandu_District,2021 census
+local_gov,Kageshwori Manohara,Kathmandu,133327,https://en.wikipedia.org/wiki/Kathmandu_District,2021 census
+local_gov,Nagarjun,Kathmandu,115507,https://en.wikipedia.org/wiki/Kathmandu_District,2021 census
+local_gov,Kirtipur,Kathmandu,81782,https://en.wikipedia.org/wiki/Kathmandu_District,2021 census
+local_gov,Dakshinkali,Kathmandu,26372,https://en.wikipedia.org/wiki/Kathmandu_District,2021 census
+local_gov,Shankharapur,Kathmandu,29318,https://en.wikipedia.org/wiki/Kathmandu_District,2021 census
+local_gov,Lalitpur Metropolitan City,Lalitpur,299843,"https://en.wikipedia.org/wiki/Lalitpur,_Nepal","Article text; the infobox says 299,283"
