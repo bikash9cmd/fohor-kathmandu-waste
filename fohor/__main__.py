@@ -25,6 +25,10 @@ def _sources():
             S3Source(config.HRSL_BUCKET, config.HRSL_REGION))
 
 
+class UsageError(Exception):
+    """A mistake the user can fix: reported in one line, exit status 2."""
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="fohor")
     ap.add_argument("--lake", default=str(config.LAKE_ROOT))
@@ -42,7 +46,14 @@ def main(argv=None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     logging.getLogger("botocore").setLevel(logging.WARNING)
     lake = open_lake(args.lake)
+    try:
+        return _dispatch(args, lake)
+    except UsageError as e:
+        print(f"{ap.prog}: error: {e}", file=sys.stderr)
+        return 2
 
+
+def _dispatch(args, lake) -> int:
     if args.cmd == "run":
         overture, hrsl = _sources()
         result = pipeline.run_all(overture, hrsl, lake, args.release)
@@ -59,9 +70,12 @@ def main(argv=None) -> int:
         print("in lake: ", ", ".join(sorted(load_manifest(lake)["releases"])))
         return 0
     if args.cmd == "blockade":
-        release, backlog = pipeline.load_current(lake, "blockade_backlog")
-        _, waste = pipeline.load_current(lake, "municipality_waste")
-        print(blockade_report(backlog, waste, args.days, release))
+        release, backlog = _load_current(lake, "blockade_backlog")
+        _, waste = _load_current(lake, "municipality_waste")
+        try:
+            print(blockade_report(backlog, waste, args.days, release))
+        except ValueError as e:
+            raise UsageError(e) from e
         return 0
     if args.cmd == "query":
         import duckdb
@@ -69,10 +83,20 @@ def main(argv=None) -> int:
         con = duckdb.connect()
         for table in ("municipality_waste", "blockade_backlog", "drop_off_access", "facility_registry",
                       "data_gaps", "facility_changes"):
-            con.register(table, pipeline.load_current(lake, table)[1])
-        print(con.sql(args.sql))
+            con.register(table, _load_current(lake, table)[1])
+        try:
+            print(con.sql(args.sql))
+        except duckdb.Error as e:
+            raise UsageError(f"query failed: {e}") from e
         return 0
     return 2
+
+
+def _load_current(lake, table: str):
+    try:
+        return pipeline.load_current(lake, table)
+    except RuntimeError as e:  # nothing published yet
+        raise UsageError(e) from e
 
 
 if __name__ == "__main__":
