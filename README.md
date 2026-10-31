@@ -1,5 +1,7 @@
 # Fohor (फोहोर): where the Kathmandu Valley's waste goes, and what happens when it can't
 
+[![Try it live](https://img.shields.io/badge/Try_it-live-2ea44f?style=for-the-badge)](https://fohor-kathmandu-waste.onrender.com)
+
 Every day about **1,400 tonnes** of waste from the Kathmandu Valley is trucked over the hills to one landfill, Bancharedanda, on the Nuwakot/Dhading border. It opened in May 2022 with a 20-year design life and was described as overwhelmed after four. When the people who live beside it block the road, and they have, repeatedly, garbage piles up on Kathmandu's streets within days.
 
 Fohor is a data pipeline that answers the questions a ward office or a newsroom asks on day one of a blockade: **how much will pile up, where first, and how long will it take to clear?** It also maps the other half of the problem, how few recycling drop-offs the valley's open map knows about. It builds a small lakehouse on AWS from open data (Overture Maps and Meta's population layer on the AWS Open Data registry, the 2021 census, and published landfill figures), reads **0.18% of the 119 GB** it draws on, refuses to publish a release that fails its quality gate, and costs about **$1.14 a month**.
@@ -105,6 +107,16 @@ The full log is [docs/CHALLENGES_AND_BUGS.md](docs/CHALLENGES_AND_BUGS.md). The 
 3. **Meta's population layer doubles Kathmandu.** Use each source for what it's good at: census for totals, buildings for where people live inside a municipality.
 4. **Momo shops and fireflies in the recycling registry.** Substring matching on "dump" and "junk" found every Dumpling restaurant and every business called Junkiri. Word-boundary patterns, category first, and the evidence recorded on each row.
 5. **Every truck route was unreachable.** The road nearest the landfill is an internal service road in a two-node island. Snap only to the main connected component.
+
+## Try it live
+
+**[https://fohor-kathmandu-waste.onrender.com](https://fohor-kathmandu-waste.onrender.com)**
+
+Slide the number of days the landfill road is blocked and read the blockade report, see where the waste comes from, how far people live from a recycling drop-off, and run SQL over the gold tables.
+
+It runs on a free server that sleeps when nobody is using it, so the first visit can take a minute to wake up. Everything runs offline: no API keys, no cloud account.
+
+To run the same page locally: `pip install -r requirements-app.txt` and then `streamlit run app.py`.
 
 ## Run it
 
