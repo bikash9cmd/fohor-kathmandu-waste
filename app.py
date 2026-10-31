@@ -9,12 +9,13 @@ against the public Overture Maps and HRSL buckets (anonymous S3, about a minute)
 import duckdb
 import streamlit as st
 
+import brand
 from fohor import config, pipeline
 from fohor.report import blockade_report
 from fohor.source import S3Source
 from fohor.storage import open_lake
 
-st.set_page_config(page_title="Fohor", page_icon="🗑️", layout="wide")
+brand.page("fohor")
 
 TABLES = (
     "municipality_waste",
@@ -46,11 +47,6 @@ def table(name: str):
     return pipeline.load_current(lake(), name)
 
 
-st.title("Fohor (फोहोर)")
-st.caption(
-    "Where the Kathmandu Valley's 1,400 tonnes a day of waste goes, and what happens when the landfill road is blocked."
-)
-
 release, waste = table("municipality_waste")
 _, backlog = table("blockade_backlog")
 st.caption(f"Overture Maps release {release}.")
@@ -61,7 +57,7 @@ blockade, sources, recycling, query = st.tabs(
 
 with blockade:
     days = st.slider("Bancharedanda landfill road blocked for (days)", 1, 30, 7)
-    st.code(blockade_report(backlog, waste, days, release), language=None)
+    st.code(blockade_report(backlog, waste, days, release), language=None, wrap_lines=True)
     valley = backlog[backlog.name_en.str.startswith("Kathmandu Valley")].set_index("days_blocked")
     st.subheader("Days to clear after the road reopens")
     st.line_chart(
@@ -107,7 +103,7 @@ with query:
         "from municipality_waste\norder by tonnes_per_day desc",
         height=130,
     )
-    if st.button("Run"):
+    if st.button("Run query", type="primary"):
         con = duckdb.connect()
         for t in TABLES:
             con.register(t, table(t)[1])
@@ -115,3 +111,5 @@ with query:
             st.dataframe(con.sql(q).df(), hide_index=True, width="stretch")
         except duckdb.Error as e:
             st.error(str(e))
+
+brand.footer()
